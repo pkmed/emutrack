@@ -2,13 +2,21 @@
  * Release retrieval logic, fully decoupled from the UI.
  *
  * Two retrieval methods are supported:
- *  1. GitHub Releases API (github.com or self-hosted GitHub Enterprise at /api/v3)
+ *  1. GitHub Releases API (github.com, self-hosted GitHub Enterprise at
+ *     /api/v3, or Forgejo/Gitea servers at /api/v1 — Forgejo and Gitea return
+ *     GitHub-shaped release objects, so the same mapping works for either)
  *  2. Best-effort HTML parsing of the releases page (for self-hosted instances
  *     with permissive CORS; github.com does not allow cross-origin HTML fetches)
  *
  * The API method is always tried first because it is more reliable. If the API
  * fails, the HTML parser runs as a fallback. This module runs in the browser;
  * DOMParser is only used on the HTML path.
+ *
+ * Note on CORS: a pure client-side app can only read a server's responses if
+ * that server sends Access-Control-Allow-Origin headers. Servers without CORS
+ * remain unreachable from static deployments (there is deliberately no
+ * backend/proxy on GitHub Pages); the optional same-origin proxy route only
+ * exists in server-hosted deployments.
  */
 import type { AssetInfo, ReleaseInfo } from './types'
 
@@ -144,42 +152,53 @@ function mapApiAssets(release: ApiRelease): AssetInfo[] {
     }))
 }
 
-async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
-  const url = `${p.apiBase}/repos/${p.owner}/${p.repo}/releases?per_page=15`
+function asSourceError(err: unknown): SourceError {
+  if (err instanceof SourceError) return err
+  const msg = err instanceof Error ? err.message : String(err)
+  return new SourceError(`network request failed: ${msg}`)
+}
+
+/**
+ * REST roots to try for a repository host. github.com has a single canonical
+ * root; other hosts may be Forgejo/Gitea (/api/v1) or GitHub Enterprise
+ * (/api/v3) — both serve GitHub-shaped release data, so both are tried.
+ */
+function apiCandidates(p: ParsedRepoUrl): string[] {
+  if (p.isGithubCom) return [p.apiBase]
+  return [`${p.origin}/api/v1`, `${p.origin}/api/v3`]
+}
+
+async function tryApiCandidate(base: string, p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
+  const url = `${base}/repos/${p.owner}/${p.repo}/releases?per_page=15`
   let res: Response
   try {
     res = await fetchReleaseResource(url, 'application/vnd.github+json')
   } catch (err) {
-    throw friendlyNetworkError(
-      err,
-      p.isGithubCom
-        ? 'Could not reach the GitHub API'
-        : 'Could not reach the API endpoint of this server'
-    )
+    throw asSourceError(err)
   }
 
   if (res.status === 404) {
-    throw new SourceError('Repository not found via API (wrong owner/repo, private repo, or API disabled on this server).')
+    throw new SourceError('repository not found (wrong owner/repo, private repo, or API disabled on this server)')
   }
   if (res.status === 403 || res.status === 429) {
-    throw new SourceError('The API refused the request (rate limit or forbidden). Try again later.')
+    throw new SourceError('the API refused the request (rate limit or forbidden); try again later')
   }
   if (!res.ok) {
-    throw new SourceError(`API request failed with HTTP ${res.status}.`)
+    throw new SourceError(`request failed with HTTP ${res.status}`)
   }
   const contentType = res.headers.get('content-type') ?? ''
   if (!contentType.includes('json')) {
-    throw new SourceError('The API endpoint did not return JSON — it is probably not a GitHub-compatible server.')
+    throw new SourceError('the endpoint did not return JSON — it is probably not a GitHub-compatible server')
   }
 
   let list: unknown
   try {
     list = await res.json()
   } catch {
-    throw new SourceError('The API returned malformed JSON.')
+    throw new SourceError('the API returned malformed JSON')
   }
   if (!Array.isArray(list)) {
-    throw new SourceError('Unexpected API response shape (expected an array of releases).')
+    throw new SourceError('unexpected API response shape (expected an array of releases)')
   }
 
   const release = (list as ApiRelease[]).find((r) => r && r.draft !== true && typeof r.tag_name === 'string')
@@ -197,6 +216,35 @@ async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
     fetchedVia: 'api',
     fetchedAt: new Date().toISOString(),
   }
+}
+
+async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
+  const candidates = apiCandidates(p)
+  const problems: string[] = []
+
+  for (const base of candidates) {
+    try {
+      return await tryApiCandidate(base, p)
+    } catch (err) {
+      problems.push(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  if (candidates.length === 1) {
+    const msg = problems[0]
+    throw new SourceError(
+      p.isGithubCom
+        ? `Could not reach the GitHub API: ${msg}`
+        : `Could not reach the API endpoint of this server: ${msg}`
+    )
+  }
+
+  const tried = candidates.map((c) => new URL(c).pathname).join(' and ')
+  const unique = [...new Set(problems)].join('; ')
+  throw new SourceError(
+    `Could not reach the API endpoint of this server (tried ${tried}): ${unique}. ` +
+      'If this is CORS-related, the server must send Access-Control-Allow-Origin headers for a browser to read its responses.'
+  )
 }
 
 /* ----------------------------- HTML method ----------------------------- */
