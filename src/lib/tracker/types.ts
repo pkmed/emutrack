@@ -48,6 +48,12 @@ export interface TrackedRepo {
   lastCheckedAt: string | null
   lastError: string | null
   lastStatus: CheckStatus
+  /**
+   * Opt-in fallback for servers that block browser access (no CORS
+   * headers): retry lookups through a public relay service. Requests then
+   * pass through a third party, so this is off unless the user enables it.
+   */
+  relay?: boolean
 }
 
 /** JSON backup schema (spec version 1). */
@@ -64,6 +70,8 @@ export interface ExportedRepo {
   lastAcknowledgedReleaseId?: string | null
   lastAcknowledgedTitle?: string | null
   lastAcknowledgedPublishedAt?: string | null
+  /** Optional device-local preference, carried along additively (v1 readers ignore unknown fields). */
+  relay?: boolean
 }
 
 /** A release is pending when its identity differs from the last acknowledged one. */

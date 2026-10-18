@@ -13,10 +13,13 @@
  * DOMParser is only used on the HTML path.
  *
  * Note on CORS: a pure client-side app can only read a server's responses if
- * that server sends Access-Control-Allow-Origin headers. Servers without CORS
- * remain unreachable from static deployments (there is deliberately no
- * backend/proxy on GitHub Pages); the optional same-origin proxy route only
- * exists in server-hosted deployments.
+ * that server sends Access-Control-Allow-Origin headers. Many self-hosted
+ * Forgejo/Gitea instances (git.eden-emu.dev among them) do not, so the browser
+ * blocks every direct request to them. When that happens the fetch helper
+ * falls back to an optional same-origin proxy route (only present in
+ * server-hosted deployments) and, if the user has opted in per repository,
+ * through a public CORS relay — a third-party service with no uptime
+ * guarantees and its own rate limits.
  */
 import type { AssetInfo, ReleaseInfo } from './types'
 
@@ -80,16 +83,71 @@ export function repoKey(rawUrl: string): string | null {
 }
 
 /**
+ * Public CORS relays, tried in order. A relay fetches the resource
+ * server-side and re-serves it with permissive CORS headers, making
+ * no-CORS servers reachable from a static deployment. These are third-party
+ * services: no uptime guarantees, separate rate limits, and every request
+ * (URL only — this app has no credentials) is visible to the operator.
+ * They are therefore strictly opt-in per repository.
+ */
+const RELAYS: Array<{ name: string; build: (url: string) => string }> = [
+  { name: 'api.cors.lol', build: (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}` },
+  { name: 'api.allorigins.win', build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { name: 'api.codetabs.com', build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+]
+
+/** AbortSignal.timeout is not available in every target browser; degrade gracefully. */
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  try {
+    return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(ms)
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Run the request through the public relays in order and return the first
+ * usable response. "Usable" means OK, or 404 (a meaningful upstream answer —
+ * e.g. repository not found — that must not trigger the next relay). Relay
+ * rate limits / outages (403, 429, 5xx, network errors) move on to the next
+ * entry; if all of them fail, a summarising SourceError is thrown.
+ */
+async function fetchViaRelay(url: string): Promise<Response> {
+  const problems: string[] = []
+  for (const relay of RELAYS) {
+    try {
+      const res = await fetch(relay.build(url), {
+        cache: 'no-store',
+        signal: timeoutSignal(12_000),
+      })
+      if (res.ok || res.status === 404) return res
+      problems.push(`${relay.name}: HTTP ${res.status}`)
+    } catch (err) {
+      problems.push(`${relay.name}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  throw new SourceError(`all public relays failed (${problems.join('; ')})`)
+}
+
+/**
  * Fetch helper used by both retrieval methods.
  * Tries a direct browser fetch first (the normal case on GitHub Pages).
  * If the request is blocked at the network level (CORS / offline proxy),
- * it retries once through an optional same-origin proxy route. When the app
- * is deployed as a pure static site the proxy simply does not exist and the
- * original error is rethrown, so behaviour matches the "no backend" spec.
+ * it retries through an optional same-origin proxy route. When the app
+ * is deployed as a pure static site the proxy simply does not exist; in
+ * that case, and only when the user opted in, public relays are tried.
+ * With everything exhausted the original direct error is rethrown, so the
+ * honest root cause is never masked.
  */
-async function fetchReleaseResource(url: string, accept: string): Promise<Response> {
+async function fetchReleaseResource(url: string, accept: string, relay: boolean): Promise<Response> {
   try {
-    return await fetch(url, { headers: { Accept: accept }, cache: 'no-store' })
+    return await fetch(url, {
+      headers: { Accept: accept },
+      cache: 'no-store',
+      signal: timeoutSignal(20_000),
+    })
   } catch (directError) {
     try {
       const proxied = await fetch(
@@ -99,13 +157,16 @@ async function fetchReleaseResource(url: string, accept: string): Promise<Respon
       // On pure static hosting (GitHub Pages) the proxy route does not exist
       // and the SPA's HTML 404 page comes back instead. A real proxy response
       // from an upstream API is JSON, so a 404 + HTML answer means "no proxy
-      // here" — keep the original direct-fetch error, which is the honest one.
+      // here" — keep going.
       const proxyMissing =
         proxied.status === 404 &&
         (proxied.headers.get('content-type') ?? '').includes('text/html')
       if (!proxyMissing) return proxied
     } catch {
-      // Proxy unreachable — fall through to the direct error.
+      // Proxy unreachable — fall through.
+    }
+    if (relay) {
+      return await fetchViaRelay(url)
     }
     throw directError
   }
@@ -168,11 +229,35 @@ function apiCandidates(p: ParsedRepoUrl): string[] {
   return [`${p.origin}/api/v1`, `${p.origin}/api/v3`]
 }
 
-async function tryApiCandidate(base: string, p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
+/** Errors that mean the browser could not even complete the request (CORS, DNS, offline). */
+const NETWORK_FAIL_RE = /network request failed|failed to fetch|networkerror|load failed|fetch failed|all public relays failed/i
+
+function isNetworkFailure(message: string): boolean {
+  return NETWORK_FAIL_RE.test(message)
+}
+
+/**
+ * Actionable guidance shown when a non-GitHub server blocks browser access.
+ * This is the single most common failure for self-hosted Forgejo/Gitea
+ * instances, so the message must lead with the fix, not the jargon.
+ */
+function corsGuidanceError(p: ParsedRepoUrl, tried: string, technical: string, relay: boolean): SourceError {
+  const fixes = relay
+    ? 'Public relays are enabled for this repository, but all of them failed (rate limits or outages) — try again later, or ask the server admin to enable CORS.'
+    : 'Fixes: enable “Fetch via public relay” for this repository (Repos → Edit), track a GitHub mirror of the releases instead, or ask the server admin to enable CORS.'
+  return new SourceError(
+    `${p.host} blocks browser access (no CORS headers), so this app cannot read it directly` +
+      (tried ? ` (tried ${tried})` : '') +
+      `. ${fixes} ` +
+      `(Technical detail: ${technical})`
+  )
+}
+
+async function tryApiCandidate(base: string, p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
   const url = `${base}/repos/${p.owner}/${p.repo}/releases?per_page=15`
   let res: Response
   try {
-    res = await fetchReleaseResource(url, 'application/vnd.github+json')
+    res = await fetchReleaseResource(url, 'application/vnd.github+json', relay)
   } catch (err) {
     throw asSourceError(err)
   }
@@ -218,13 +303,13 @@ async function tryApiCandidate(base: string, p: ParsedRepoUrl): Promise<ReleaseI
   }
 }
 
-async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
+async function fetchViaApi(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
   const candidates = apiCandidates(p)
   const problems: string[] = []
 
   for (const base of candidates) {
     try {
-      return await tryApiCandidate(base, p)
+      return await tryApiCandidate(base, p, relay)
     } catch (err) {
       problems.push(err instanceof Error ? err.message : String(err))
     }
@@ -232,6 +317,9 @@ async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
 
   if (candidates.length === 1) {
     const msg = problems[0]
+    if (!p.isGithubCom && isNetworkFailure(msg)) {
+      throw corsGuidanceError(p, '', msg, relay)
+    }
     throw new SourceError(
       p.isGithubCom
         ? `Could not reach the GitHub API: ${msg}`
@@ -241,6 +329,9 @@ async function fetchViaApi(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
 
   const tried = candidates.map((c) => new URL(c).pathname).join(' and ')
   const unique = [...new Set(problems)].join('; ')
+  if (problems.some(isNetworkFailure)) {
+    throw corsGuidanceError(p, tried, unique, relay)
+  }
   throw new SourceError(
     `Could not reach the API endpoint of this server (tried ${tried}): ${unique}. ` +
       'If this is CORS-related, the server must send Access-Control-Allow-Origin headers for a browser to read its responses.'
@@ -309,9 +400,9 @@ function parseReleasesHtml(html: string, baseUrl: string): ReleaseInfo | null {
 }
 
 /** GitHub serves the asset list for a release as a small HTML fragment. */
-async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string): Promise<AssetInfo[]> {
+async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string, relay: boolean): Promise<AssetInfo[]> {
   const fragUrl = `${p.origin}/${p.owner}/${p.repo}/releases/expanded_assets/${encodeURIComponent(tag)}`
-  const res = await fetchReleaseResource(fragUrl, 'text/html')
+  const res = await fetchReleaseResource(fragUrl, 'text/html', relay)
   if (!res.ok) return []
   const contentType = res.headers.get('content-type') ?? ''
   if (!contentType.includes('html')) return []
@@ -341,14 +432,14 @@ async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string): Promise<AssetInfo
   return assets
 }
 
-async function fetchViaHtml(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
+async function fetchViaHtml(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
   let res: Response
   try {
-    res = await fetchReleaseResource(p.releasesUrl, 'text/html')
+    res = await fetchReleaseResource(p.releasesUrl, 'text/html', relay)
   } catch (err) {
     throw friendlyNetworkError(
       err,
-      'HTML parsing was blocked (CORS or network). The server must allow cross-origin requests for HTML fallback to work; API access is recommended'
+      'HTML fallback was blocked (CORS or network); API access is recommended'
     )
   }
   if (!res.ok) {
@@ -363,7 +454,7 @@ async function fetchViaHtml(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
   if (!release) return 'empty'
 
   try {
-    release.assets = await fetchHtmlAssets(p, release.tag)
+    release.assets = await fetchHtmlAssets(p, release.tag, relay)
   } catch {
     // Asset list is best-effort; the release itself is still usable.
     release.assets = []
@@ -375,27 +466,44 @@ async function fetchViaHtml(p: ParsedRepoUrl): Promise<ReleaseInfo | 'empty'> {
 
 export type FetchResult = ReleaseInfo | 'empty'
 
+export interface FetchOptions {
+  /**
+   * Retry failed lookups through a public CORS relay (third-party service).
+   * Strictly opt-in: requests then pass through infrastructure the user
+   * does not control, so it is only appropriate for public repositories.
+   */
+  relay?: boolean
+}
+
 /**
  * Fetch the latest published release for a repository release page URL.
  * Tries the structured API first, then falls back to HTML parsing.
  */
-export async function fetchLatestRelease(repoUrl: string): Promise<FetchResult> {
+export async function fetchLatestRelease(repoUrl: string, options: FetchOptions = {}): Promise<FetchResult> {
   const parsed = parseRepoUrl(repoUrl)
   if (!parsed) {
     throw new SourceError('Unrecognized repository URL. Expected something like https://github.com/owner/repo/releases')
   }
+  const relay = options.relay === true
 
   let apiError: unknown
   try {
-    return await fetchViaApi(parsed)
+    return await fetchViaApi(parsed, relay)
   } catch (err) {
     apiError = err
   }
 
+  const apiMsg = apiError instanceof Error ? apiError.message : String(apiError)
+  // A network-level block (CORS, DNS, offline) kills every cross-origin
+  // request to that host — the HTML fallback would fail identically, so skip
+  // it instead of appending a second copy of the same wall of text.
+  if (isNetworkFailure(apiMsg)) {
+    throw apiError instanceof SourceError ? apiError : new SourceError(apiMsg)
+  }
+
   try {
-    return await fetchViaHtml(parsed)
+    return await fetchViaHtml(parsed, relay)
   } catch (htmlError) {
-    const apiMsg = apiError instanceof Error ? apiError.message : String(apiError)
     const htmlMsg = htmlError instanceof Error ? htmlError.message : String(htmlError)
     throw new SourceError(`${apiMsg} — HTML fallback also failed: ${htmlMsg}`)
   }

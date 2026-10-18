@@ -14,6 +14,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,7 @@ export interface RepoDraft {
   id: string
   name: string
   url: string
+  relay: boolean
 }
 
 interface ReposScreenProps {
@@ -45,6 +47,7 @@ interface FormState {
   id: string | null
   name: string
   url: string
+  relay: boolean
 }
 
 export function ReposScreen({ repos, onBack, onSave, onDelete }: ReposScreenProps) {
@@ -52,8 +55,9 @@ export function ReposScreen({ repos, onBack, onSave, onDelete }: ReposScreenProp
   const [deleteTarget, setDeleteTarget] = useState<TrackedRepo | null>(null)
   const [saving, setSaving] = useState(false)
 
-  const openAdd = () => setForm({ id: null, name: '', url: '' })
-  const openEdit = (repo: TrackedRepo) => setForm({ id: repo.id, name: repo.name, url: repo.url })
+  const openAdd = () => setForm({ id: null, name: '', url: '', relay: false })
+  const openEdit = (repo: TrackedRepo) =>
+    setForm({ id: repo.id, name: repo.name, url: repo.url, relay: repo.relay === true })
   const closeForm = () => setForm(null)
 
   const parsed = form ? parseRepoUrl(form.url) : null
@@ -79,6 +83,7 @@ export function ReposScreen({ repos, onBack, onSave, onDelete }: ReposScreenProp
         id: form.id ?? newId(),
         name: form.name.trim(),
         url: form.url.trim(),
+        relay: form.relay,
       })
       closeForm()
     } finally {
@@ -183,6 +188,26 @@ export function ReposScreen({ repos, onBack, onSave, onDelete }: ReposScreenProp
                   Detected: {parsed.owner}/{parsed.repo}
                 </p>
               ) : null}
+            </div>
+            <div className="grid gap-2">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="repo-relay"
+                  checked={form?.relay ?? false}
+                  onCheckedChange={(v) => setForm((f) => (f ? { ...f, relay: v === true } : f))}
+                />
+                <Label
+                  htmlFor="repo-relay"
+                  className="text-sm font-normal leading-none"
+                >
+                  Fetch via public relay
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Only for servers that block browser access (no CORS headers), e.g. self-hosted
+                Forgejo/Gitea. When enabled, release lookups go through a third-party relay
+                service — use with public repositories only.
+              </p>
             </div>
           </div>
           <DialogFooter>

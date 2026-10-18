@@ -8,8 +8,24 @@
  * works both at a domain root and on a sub-path such as
  * https://<user>.github.io/<repo>/ (GitHub Pages project sites).
  */
-const VERSION = 'emutrack-v2'
+const VERSION = 'emutrack-v3'
 const ROOT = new URL('./', self.registration.scope || self.location.href)
+// Path prefix of hashed build assets, correct for both domain-root and
+// sub-path deployments (e.g. /emutrack/_next/static/ on GitHub Pages).
+const STATIC_PREFIX = ROOT.pathname.replace(/\/$/, '') + '/_next/static/'
+// Request destinations that are safe to cache. Data requests made with
+// fetch() (destination 'empty', e.g. /api/release-proxy) are excluded so
+// release lookups always hit the network and are never served from cache.
+const STATIC_DESTINATIONS = new Set([
+  'script',
+  'style',
+  'image',
+  'font',
+  'manifest',
+  'audio',
+  'video',
+  'worker',
+])
 const PRECACHE = [
   ROOT.href,
   new URL('manifest.webmanifest', ROOT).href,
@@ -67,7 +83,13 @@ self.addEventListener('fetch', (event) => {
     return
   }
 
-  // Same-origin static assets: stale-while-revalidate.
+  // Same-origin static assets only: stale-while-revalidate. API/data
+  // requests (destination 'empty') are never intercepted — release checks
+  // must always reach the network, and a cached API answer would hide
+  // outages and serve stale releases.
+  if (!STATIC_DESTINATIONS.has(req.destination) && !url.pathname.startsWith(STATIC_PREFIX)) {
+    return
+  }
   event.respondWith(
     caches.match(req).then((cached) => {
       const network = fetch(req)

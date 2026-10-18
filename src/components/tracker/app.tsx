@@ -64,6 +64,7 @@ function repoFromExport(e: ExportedRepo): TrackedRepo {
     lastCheckedAt: null,
     lastError: null,
     lastStatus: 'idle',
+    relay: e.relay === true,
   }
 }
 
@@ -99,6 +100,7 @@ function validateImportFile(json: unknown): { ok: true; repos: ExportedRepo[] } 
       lastAcknowledgedTitle: typeof item.lastAcknowledgedTitle === 'string' ? item.lastAcknowledgedTitle : null,
       lastAcknowledgedPublishedAt:
         typeof item.lastAcknowledgedPublishedAt === 'string' ? item.lastAcknowledgedPublishedAt : null,
+      relay: item.relay === true,
     })
   }
   return { ok: true, repos: out }
@@ -159,7 +161,7 @@ export default function EmuTrackApp() {
     async (draft: RepoDraft) => {
       const existing = reposRef.current.find((r) => r.id === draft.id)
       if (existing) {
-        await mutateRepo(draft.id, { name: draft.name, url: draft.url })
+        await mutateRepo(draft.id, { name: draft.name, url: draft.url, relay: draft.relay })
         toast.success('Repository updated')
       } else {
         const repo: TrackedRepo = {
@@ -171,6 +173,7 @@ export default function EmuTrackApp() {
           lastCheckedAt: null,
           lastError: null,
           lastStatus: 'idle',
+          relay: draft.relay,
         }
         applyRepos([...reposRef.current, repo])
         try {
@@ -209,7 +212,7 @@ export default function EmuTrackApp() {
       setCheckingIds(new Set(checkingIdsRef.current))
       const now = new Date().toISOString()
       try {
-        const result = await fetchLatestRelease(repo.url)
+        const result = await fetchLatestRelease(repo.url, { relay: repo.relay === true })
         if (result === 'empty') {
           await mutateRepo(id, { latest: null, lastCheckedAt: now, lastStatus: 'empty', lastError: null })
         } else {
@@ -269,6 +272,7 @@ export default function EmuTrackApp() {
         lastAcknowledgedReleaseId: r.acknowledged?.releaseId ?? null,
         lastAcknowledgedTitle: r.acknowledged?.title ?? null,
         lastAcknowledgedPublishedAt: r.acknowledged?.publishedAt ?? null,
+        ...(r.relay ? { relay: true } : {}),
       })),
     }
     const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
