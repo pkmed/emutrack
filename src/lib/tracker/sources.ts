@@ -107,28 +107,96 @@ function timeoutSignal(ms: number): AbortSignal | undefined {
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Free relays rate-limit per client, and the UI fires repository checks in
+ * parallel ("check all"). Without coordination, simultaneous relay requests
+ * race each other into HTTP 429s — which shows up as "one repository
+ * succeeds while its neighbour fails", even though both are perfectly fine.
+ * A module-level queue serializes every relay attempt app-wide and keeps a
+ * minimum gap between request starts, so batch checks politely take turns
+ * instead of fighting over the same per-minute quota.
+ */
+const RELAY_MIN_INTERVAL_MS = 1_100
+let relayQueueTail: Promise<unknown> = Promise.resolve()
+let lastRelayStartAt = 0
+
+function enqueueRelayAttempt<T>(task: () => Promise<T>): Promise<T> {
+  const run = relayQueueTail.then(async () => {
+    const wait = lastRelayStartAt + RELAY_MIN_INTERVAL_MS - Date.now()
+    if (wait > 0) await sleep(wait)
+    lastRelayStartAt = Date.now()
+    return task()
+  })
+  // Keep the queue alive regardless of how this attempt ends.
+  relayQueueTail = run.then(
+    () => undefined,
+    () => undefined
+  )
+  return run
+}
+
+/** One attempt against one relay, with a single polite retry when rate-limited. */
+async function attemptRelay(relay: (typeof RELAYS)[number], url: string): Promise<Response> {
+  let res = await fetch(relay.build(url), {
+    cache: 'no-store',
+    signal: timeoutSignal(12_000),
+  })
+  if (res.status === 429) {
+    // Token-bucket style limits usually clear within seconds; a short backoff
+    // rescues the common case without burning the remaining relays.
+    await sleep(1_800)
+    res = await fetch(relay.build(url), {
+      cache: 'no-store',
+      signal: timeoutSignal(12_000),
+    })
+  }
+  return res
+}
+
+/**
+ * Thrown when every relay has been tried and none returned a usable answer.
+ * Distinct from a plain SourceError so callers can stop early: if the relays
+ * are exhausted there is no point re-running the whole chain for the next
+ * API candidate (/api/v3 after /api/v1) or for the HTML fallback.
+ */
+class RelayExhaustedError extends SourceError {}
+
 /**
  * Run the request through the public relays in order and return the first
  * usable response. "Usable" means OK, or 404 (a meaningful upstream answer —
  * e.g. repository not found — that must not trigger the next relay). Relay
  * rate limits / outages (403, 429, 5xx, network errors) move on to the next
- * entry; if all of them fail, a summarising SourceError is thrown.
+ * entry; if all of them fail, a summarising RelayExhaustedError is thrown.
  */
 async function fetchViaRelay(url: string): Promise<Response> {
   const problems: string[] = []
+  let sawRateLimit = false
   for (const relay of RELAYS) {
     try {
-      const res = await fetch(relay.build(url), {
-        cache: 'no-store',
-        signal: timeoutSignal(12_000),
-      })
+      const res = await enqueueRelayAttempt(() => attemptRelay(relay, url))
       if (res.ok || res.status === 404) return res
-      problems.push(`${relay.name}: HTTP ${res.status}`)
+      if (res.status === 429) {
+        sawRateLimit = true
+        problems.push(`${relay.name}: HTTP 429 (rate limited)`)
+      } else {
+        problems.push(`${relay.name}: HTTP ${res.status}`)
+      }
     } catch (err) {
-      problems.push(`${relay.name}: ${err instanceof Error ? err.message : String(err)}`)
+      const msg = err instanceof Error ? err.message : String(err)
+      problems.push(`${relay.name}: ${msg}`)
+      if (/429|rate.?limit/i.test(msg)) sawRateLimit = true
     }
   }
-  throw new SourceError(`all public relays failed (${problems.join('; ')})`)
+  throw new RelayExhaustedError(
+    sawRateLimit
+      ? `all public relays are rate-limiting or down right now (${problems.join('; ')}). ` +
+          'Wait about a minute and check again — checking repositories one at a time also helps.'
+      : `all public relays failed (${problems.join('; ')})`
+  )
 }
 
 /**
@@ -230,7 +298,7 @@ function apiCandidates(p: ParsedRepoUrl): string[] {
 }
 
 /** Errors that mean the browser could not even complete the request (CORS, DNS, offline). */
-const NETWORK_FAIL_RE = /network request failed|failed to fetch|networkerror|load failed|fetch failed|all public relays failed/i
+const NETWORK_FAIL_RE = /network request failed|failed to fetch|networkerror|load failed|fetch failed|all public relays/i
 
 function isNetworkFailure(message: string): boolean {
   return NETWORK_FAIL_RE.test(message)
@@ -243,7 +311,7 @@ function isNetworkFailure(message: string): boolean {
  */
 function corsGuidanceError(p: ParsedRepoUrl, tried: string, technical: string, relay: boolean): SourceError {
   const fixes = relay
-    ? 'Public relays are enabled for this repository, but all of them failed (rate limits or outages) — try again later, or ask the server admin to enable CORS.'
+    ? 'Public relays are enabled for this repository, but all of them are rate-limiting or down right now. Wait about a minute and check again (checking repositories one at a time helps), or ask the server admin to enable CORS.'
     : 'Fixes: enable “Fetch via public relay” for this repository (Repos → Edit), track a GitHub mirror of the releases instead, or ask the server admin to enable CORS.'
   return new SourceError(
     `${p.host} blocks browser access (no CORS headers), so this app cannot read it directly` +
@@ -311,6 +379,10 @@ async function fetchViaApi(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInf
     try {
       return await tryApiCandidate(base, p, relay)
     } catch (err) {
+      // If the relay chain itself is exhausted, every other API candidate and
+      // the HTML fallback would just queue up the same doomed relay chain —
+      // surface the rate-limit summary immediately instead.
+      if (err instanceof RelayExhaustedError) throw err
       problems.push(err instanceof Error ? err.message : String(err))
     }
   }
