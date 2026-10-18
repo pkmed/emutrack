@@ -1,0 +1,77 @@
+# Builds the static export of EmuTrack and publishes it to GitHub Pages.
+#
+# One-time prerequisite in the GitHub repo:
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions"
+#
+# After that, every push to main/master redeploys the site automatically.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Project pages are served from /<repo>/; user/org sites (<user>.github.io)
+      # are served from the root and need no base path.
+      - name: Compute base path
+        id: base
+        run: |
+          if [ "${GITHUB_REPOSITORY#*/}" = "${GITHUB_REPOSITORY_OWNER}.github.io" ]; then
+            echo "path=" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The optional same-origin proxy route is server-only and cannot exist on
+      # GitHub Pages. The client already handles its absence: api.github.com
+      # sends Access-Control-Allow-Origin: *, so direct browser fetches are used.
+      - name: Strip server-only API routes
+        run: rm -rf src/app/api
+
+      - name: Build static export
+        env:
+          STATIC_EXPORT: '1'
+          BASE_PATH: ${{ steps.base.outputs.path }}
+        run: bunx next build
+
+      # Harmless belt-and-braces: lets the site also work if it is ever served
+      # through the legacy "deploy from branch" mode, where Jekyll would
+      # otherwise ignore the _next/ folder.
+      - name: Add .nojekyll
+        run: touch out/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
