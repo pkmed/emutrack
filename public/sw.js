@@ -8,7 +8,7 @@
  * works both at a domain root and on a sub-path such as
  * https://<user>.github.io/<repo>/ (GitHub Pages project sites).
  */
-const VERSION = 'emutrack-v4'
+const VERSION = 'emutrack-v5'
 const ROOT = new URL('./', self.registration.scope || self.location.href)
 // Path prefix of hashed build assets, correct for both domain-root and
 // sub-path deployments (e.g. /emutrack/_next/static/ on GitHub Pages).

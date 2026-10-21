@@ -21,6 +21,7 @@ import { MainScreen } from '@/components/tracker/main-screen'
 import { ReposScreen, type RepoDraft } from '@/components/tracker/repos-screen'
 import { SettingsScreen } from '@/components/tracker/settings-screen'
 import { ThemeToggle } from '@/components/tracker/theme-toggle'
+import { InstallBanner } from '@/components/pwa/install-button'
 import { fetchLatestRelease, repoKey } from '@/lib/tracker/sources'
 import { loadScraperApiKey } from '@/lib/tracker/settings'
 import {
@@ -410,17 +411,20 @@ export default function EmuTrackApp() {
               {loadError}
             </div>
           ) : effectiveView.name === 'main' ? (
-            <MainScreen
-              repos={repos}
-              loaded={loaded}
-              checkingAll={checkingAll}
-              checkingIds={checkingIds}
-              onCheckAll={() => void checkAll()}
-              onCheckRepo={(id) => void checkRepo(id)}
-              onMarkSeen={markSeen}
-              onOpenDetails={(id) => setView({ name: 'details', repoId: id })}
-              onManageRepos={() => setView({ name: 'repos' })}
-            />
+            <>
+              <InstallBanner />
+              <MainScreen
+                repos={repos}
+                loaded={loaded}
+                checkingAll={checkingAll}
+                checkingIds={checkingIds}
+                onCheckAll={() => void checkAll()}
+                onCheckRepo={(id) => void checkRepo(id)}
+                onMarkSeen={markSeen}
+                onOpenDetails={(id) => setView({ name: 'details', repoId: id })}
+                onManageRepos={() => setView({ name: 'repos' })}
+              />
+            </>
           ) : effectiveView.name === 'repos' ? (
             <ReposScreen
               repos={repos}

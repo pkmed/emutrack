@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { isAppleMobile, promptInstall, useInstallCapability } from '@/components/pwa/install-button'
 import { testScraperApiKey } from '@/lib/tracker/sources'
 import { loadScraperApiKey, saveScraperApiKey } from '@/lib/tracker/settings'
 
@@ -33,6 +34,7 @@ export function SettingsScreen({ onBack, onExport, onImport }: SettingsScreenPro
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
   const [testError, setTestError] = useState<string | null>(null)
+  const { available: installAvailable, standalone } = useInstallCapability()
 
   const saved = key.trim().length > 0
 
@@ -65,6 +67,46 @@ export function SettingsScreen({ onBack, onExport, onImport }: SettingsScreenPro
       </div>
 
       <div className="flex flex-col gap-4">
+        {/* ----------------------------- Install ----------------------------- */}
+        <Card>
+          <CardContent className="flex flex-col gap-3 p-4">
+            <div className="flex items-center gap-2">
+              <Download className="h-4 w-4 text-muted-foreground" aria-hidden />
+              <h2 className="font-medium">Install app</h2>
+            </div>
+            {standalone ? (
+              <p className="text-sm text-muted-foreground" role="status">
+                You are running the installed app.
+              </p>
+            ) : installAvailable ? (
+              <>
+                <p className="text-sm text-muted-foreground">
+                  Install EmuTrack on this device for a full-screen, offline-capable app window.
+                </p>
+                <div>
+                  <Button size="sm" onClick={() => void promptInstall()}>
+                    <Download className="h-4 w-4" aria-hidden />
+                    Install app
+                  </Button>
+                </div>
+              </>
+            ) : isAppleMobile() ? (
+              <p className="text-sm text-muted-foreground">
+                Browsers on iPhone/iPad don’t offer one-click install. Open this page in{' '}
+                <span className="text-foreground">Safari</span>, tap the{' '}
+                <span className="text-foreground">Share</span> button and choose{' '}
+                <span className="text-foreground">“Add to Home Screen”</span>.
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                This browser hasn’t offered one-click install yet. Try the browser menu —
+                “Install page as app” (Chrome desktop: under “Cast, save and share”) or “Add to
+                Home screen” (Android) — or reload the page and check again.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+
         {/* ------------------------- ScraperAPI key ------------------------- */}
         <Card>
           <CardContent className="flex flex-col gap-3 p-4">
