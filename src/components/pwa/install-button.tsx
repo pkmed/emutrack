@@ -140,13 +140,14 @@ export function AndroidInstallHint() {
             aria-hidden
           />
           <div className="min-w-0 space-y-1">
-            <p className="text-sm font-medium">No install option in Chrome?</p>
+            <p className="text-sm font-medium">No install option?</p>
             <p className="text-sm text-muted-foreground">
-              Chrome on Android only offers PWA install when Google Play services
-              are available on the device. You can still add EmuTrack: open
-              Chrome&apos;s ⋮ menu and choose “Add to Home screen”. Everything
-              works the same — checks, settings and data stay local on this
-              device.
+              Browsers on Android need Google Play services to install web apps as
+              real apps. You can still add EmuTrack from the browser menu — ⋮ →
+              “Add to Home screen”. If that item is missing, the browser is
+              outdated or a stripped build: installing an up-to-date Chrome,
+              Brave or Firefox will bring it back. All data stays local on this
+              device either way.
             </p>
           </div>
         </CardContent>
