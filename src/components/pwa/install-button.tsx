@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Download, Smartphone } from 'lucide-react'
+import { Download, EllipsisVertical, Smartphone } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -56,6 +56,12 @@ function currentStandalone(): boolean {
   )
 }
 
+/** True on Android devices (any browser), detected via the user agent. */
+function isAndroidDevice(): boolean {
+  if (typeof navigator === 'undefined') return false
+  return /android/i.test(navigator.userAgent)
+}
+
 /** True on iOS/iPadOS, where no browser offers the programmatic install API. */
 export function isAppleMobile(): boolean {
   if (typeof navigator === 'undefined') return false
@@ -102,6 +108,51 @@ export async function promptInstall(): Promise<'accepted' | 'dismissed' | 'unava
   deferredPrompt = null
   notifyAll()
   return outcome
+}
+
+/**
+ * Fallback hint for Android devices where the one-click install flow never
+ * appears. Chrome on Android only offers PWA install (WebAPK) when Google
+ * Play services are available — on de-Googled handhelds and custom ROMs it
+ * fires no `beforeinstallprompt` and shows no "Install app" menu entry. The
+ * ⋮ → "Add to Home screen" shortcut still works everywhere, so surface it
+ * after a delay long enough for the normal prompt to fire first on devices
+ * where Chrome is merely waiting for engagement heuristics.
+ */
+export function AndroidInstallHint() {
+  const { available, standalone } = useInstallCapability()
+  const [show, setShow] = useState(false)
+
+  useEffect(() => {
+    if (standalone || available) return
+    const timer = window.setTimeout(() => setShow(true), 3500)
+    return () => window.clearTimeout(timer)
+  }, [standalone, available])
+
+  if (standalone || available || !show || !isAndroidDevice()) return null
+
+  return (
+    <div className="pt-4">
+      <Card>
+        <CardContent className="flex items-start gap-3 p-4">
+          <EllipsisVertical
+            className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground"
+            aria-hidden
+          />
+          <div className="min-w-0 space-y-1">
+            <p className="text-sm font-medium">No install option in Chrome?</p>
+            <p className="text-sm text-muted-foreground">
+              Chrome on Android only offers PWA install when Google Play services
+              are available on the device. You can still add EmuTrack: open
+              Chrome&apos;s ⋮ menu and choose “Add to Home screen”. Everything
+              works the same — checks, settings and data stay local on this
+              device.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
 }
 
 /**

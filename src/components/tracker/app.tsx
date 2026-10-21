@@ -21,7 +21,7 @@ import { MainScreen } from '@/components/tracker/main-screen'
 import { ReposScreen, type RepoDraft } from '@/components/tracker/repos-screen'
 import { SettingsScreen } from '@/components/tracker/settings-screen'
 import { ThemeToggle } from '@/components/tracker/theme-toggle'
-import { InstallBanner } from '@/components/pwa/install-button'
+import { AndroidInstallHint, InstallBanner } from '@/components/pwa/install-button'
 import { fetchLatestRelease, repoKey } from '@/lib/tracker/sources'
 import { loadScraperApiKey } from '@/lib/tracker/settings'
 import {
@@ -413,6 +413,7 @@ export default function EmuTrackApp() {
           ) : effectiveView.name === 'main' ? (
             <>
               <InstallBanner />
+              <AndroidInstallHint />
               <MainScreen
                 repos={repos}
                 loaded={loaded}
