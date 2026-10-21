@@ -18,8 +18,9 @@
  * blocks every direct request to them. When that happens the fetch helper
  * falls back to an optional same-origin proxy route (only present in
  * server-hosted deployments) and, if the user has opted in per repository,
- * through a public CORS relay — a third-party service with no uptime
- * guarantees and its own rate limits.
+ * through ScraperAPI — a keyed third-party scraping service. The API key is
+ * configured in Settings and stored device-locally (settings.ts); every
+ * proxied request consumes ScraperAPI credits.
  */
 import type { AssetInfo, ReleaseInfo } from './types'
 
@@ -83,18 +84,16 @@ export function repoKey(rawUrl: string): string | null {
 }
 
 /**
- * Public CORS relays, tried in order. A relay fetches the resource
- * server-side and re-serves it with permissive CORS headers, making
- * no-CORS servers reachable from a static deployment. These are third-party
- * services: no uptime guarantees, separate rate limits, and every request
- * (URL only — this app has no credentials) is visible to the operator.
- * They are therefore strictly opt-in per repository.
+ * ScraperAPI (https://www.scraperapi.com) replaces the former public CORS
+ * relays: it fetches the target URL server-side and re-serves the response
+ * with permissive CORS headers, making no-CORS servers reachable from a
+ * static deployment. Unlike the anonymous free relays it is a keyed service
+ * — the API key is stored device-locally (settings.ts), every proxied
+ * request consumes credits from the account, and the free tier is limited
+ * to roughly a thousand credits per month. Usage is therefore strictly
+ * opt-in per repository.
  */
-const RELAYS: Array<{ name: string; build: (url: string) => string }> = [
-  { name: 'api.cors.lol', build: (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}` },
-  { name: 'api.allorigins.win', build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
-  { name: 'api.codetabs.com', build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
-]
+const SCRAPERAPI_BASE = 'https://api.scraperapi.com/'
 
 /** AbortSignal.timeout is not available in every target browser; degrade gracefully. */
 function timeoutSignal(ms: number): AbortSignal | undefined {
@@ -112,90 +111,109 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Free relays rate-limit per client, and the UI fires repository checks in
- * parallel ("check all"). Without coordination, simultaneous relay requests
- * race each other into HTTP 429s — which shows up as "one repository
- * succeeds while its neighbour fails", even though both are perfectly fine.
- * A module-level queue serializes every relay attempt app-wide and keeps a
- * minimum gap between request starts, so batch checks politely take turns
- * instead of fighting over the same per-minute quota.
+ * The UI fires repository checks in parallel ("check all"). Without
+ * coordination, simultaneous proxied requests race each other into HTTP 429s
+ * — which shows up as "one repository succeeds while its neighbour fails",
+ * even though both are perfectly fine — and burst through the account's
+ * concurrency limit. A module-level queue serializes every ScraperAPI
+ * attempt app-wide and keeps a minimum gap between request starts, so batch
+ * checks politely take turns.
  */
-const RELAY_MIN_INTERVAL_MS = 1_100
-let relayQueueTail: Promise<unknown> = Promise.resolve()
-let lastRelayStartAt = 0
+const SCRAPE_MIN_INTERVAL_MS = 700
+let scrapeQueueTail: Promise<unknown> = Promise.resolve()
+let lastScrapeStartAt = 0
 
-function enqueueRelayAttempt<T>(task: () => Promise<T>): Promise<T> {
-  const run = relayQueueTail.then(async () => {
-    const wait = lastRelayStartAt + RELAY_MIN_INTERVAL_MS - Date.now()
+function enqueueScrapeAttempt<T>(task: () => Promise<T>): Promise<T> {
+  const run = scrapeQueueTail.then(async () => {
+    const wait = lastScrapeStartAt + SCRAPE_MIN_INTERVAL_MS - Date.now()
     if (wait > 0) await sleep(wait)
-    lastRelayStartAt = Date.now()
+    lastScrapeStartAt = Date.now()
     return task()
   })
   // Keep the queue alive regardless of how this attempt ends.
-  relayQueueTail = run.then(
+  scrapeQueueTail = run.then(
     () => undefined,
     () => undefined
   )
   return run
 }
 
-/** One attempt against one relay, with a single polite retry when rate-limited. */
-async function attemptRelay(relay: (typeof RELAYS)[number], url: string): Promise<Response> {
-  let res = await fetch(relay.build(url), {
-    cache: 'no-store',
-    signal: timeoutSignal(12_000),
-  })
-  if (res.status === 429) {
-    // Token-bucket style limits usually clear within seconds; a short backoff
-    // rescues the common case without burning the remaining relays.
-    await sleep(1_800)
-    res = await fetch(relay.build(url), {
-      cache: 'no-store',
-      signal: timeoutSignal(12_000),
-    })
+/**
+ * Turn a non-OK ScraperAPI response into a compact, actionable description.
+ * ScraperAPI returns short plain-text/HTML bodies that name the real cause
+ * (invalid key, exhausted credits, concurrency limit), so surface them.
+ */
+async function describeScraperError(res: Response): Promise<string> {
+  let body = ''
+  try {
+    body = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 180)
+  } catch {
+    // Body is optional; the status label alone still helps.
   }
-  return res
+  const label =
+    res.status === 401
+      ? 'HTTP 401 — API key rejected'
+      : res.status === 403
+        ? 'HTTP 403 — out of API credits or plan limit'
+        : res.status === 429
+          ? 'HTTP 429 — rate limited'
+          : `HTTP ${res.status}`
+  return body ? `${label}: ${body}` : label
 }
 
 /**
- * Thrown when every relay has been tried and none returned a usable answer.
- * Distinct from a plain SourceError so callers can stop early: if the relays
- * are exhausted there is no point re-running the whole chain for the next
- * API candidate (/api/v3 after /api/v1) or for the HTML fallback.
+ * Thrown when the ScraperAPI path has failed for reasons that will not
+ * change between retries (bad key, exhausted credits, service down).
+ * Distinct from a plain SourceError so callers can stop early: there is no
+ * point re-running the whole chain for the next API candidate (/api/v3
+ * after /api/v1) or for the HTML fallback — both would make the same
+ * doomed (and credit-consuming) proxied requests.
  */
-class RelayExhaustedError extends SourceError {}
+class ScrapeExhaustedError extends SourceError {}
 
 /**
- * Run the request through the public relays in order and return the first
- * usable response. "Usable" means OK, or 404 (a meaningful upstream answer —
- * e.g. repository not found — that must not trigger the next relay). Relay
- * rate limits / outages (403, 429, 5xx, network errors) move on to the next
- * entry; if all of them fail, a summarising RelayExhaustedError is thrown.
+ * Run the request through ScraperAPI and return the response.
+ * "Usable" means OK, or 404 (a meaningful upstream answer — e.g. repository
+ * not found — that must not trigger a retry). One polite retry is made when
+ * rate-limited; key/account problems (401/403) fail immediately because
+ * retrying would only burn more credits.
  */
-async function fetchViaRelay(url: string): Promise<Response> {
+async function fetchViaScraperApi(url: string, apiKey: string): Promise<Response> {
+  if (!apiKey) {
+    throw new ScrapeExhaustedError(
+      'Fetch via ScraperAPI is enabled for this repository, but no ScraperAPI API key is configured. ' +
+        'Add your key in Settings (the 3-dot menu) and try again.'
+    )
+  }
+  const build = () =>
+    `${SCRAPERAPI_BASE}?api_key=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(url)}`
   const problems: string[] = []
   let sawRateLimit = false
-  for (const relay of RELAYS) {
+  let keyProblem = false
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const res = await enqueueRelayAttempt(() => attemptRelay(relay, url))
+      const res = await enqueueScrapeAttempt(() =>
+        fetch(build(), { cache: 'no-store', signal: timeoutSignal(30_000) })
+      )
       if (res.ok || res.status === 404) return res
-      if (res.status === 429) {
-        sawRateLimit = true
-        problems.push(`${relay.name}: HTTP 429 (rate limited)`)
-      } else {
-        problems.push(`${relay.name}: HTTP ${res.status}`)
+      problems.push(await describeScraperError(res))
+      if (res.status === 429) sawRateLimit = true
+      if (res.status === 401 || res.status === 403) {
+        keyProblem = true
+        break // retrying a bad key or empty quota changes nothing
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      problems.push(`${relay.name}: ${msg}`)
+      problems.push(msg)
       if (/429|rate.?limit/i.test(msg)) sawRateLimit = true
     }
+    if (attempt === 1) await sleep(1_800)
   }
-  throw new RelayExhaustedError(
-    sawRateLimit
-      ? `all public relays are rate-limiting or down right now (${problems.join('; ')}). ` +
-          'Wait about a minute and check again — checking repositories one at a time also helps.'
-      : `all public relays failed (${problems.join('; ')})`
+  throw new ScrapeExhaustedError(
+    sawRateLimit && !keyProblem
+      ? `ScraperAPI is rate-limiting this device right now (${problems.join('; ')}). ` +
+          'Wait a little and check again — checking repositories one at a time also helps.'
+      : `ScraperAPI request failed (${problems.join('; ')})`
   )
 }
 
@@ -205,11 +223,17 @@ async function fetchViaRelay(url: string): Promise<Response> {
  * If the request is blocked at the network level (CORS / offline proxy),
  * it retries through an optional same-origin proxy route. When the app
  * is deployed as a pure static site the proxy simply does not exist; in
- * that case, and only when the user opted in, public relays are tried.
- * With everything exhausted the original direct error is rethrown, so the
- * honest root cause is never masked.
+ * that case, and only when the user opted in with a configured key, the
+ * request is routed through ScraperAPI. With everything exhausted the
+ * original direct error is rethrown, so the honest root cause is never
+ * masked.
  */
-async function fetchReleaseResource(url: string, accept: string, relay: boolean): Promise<Response> {
+async function fetchReleaseResource(
+  url: string,
+  accept: string,
+  relay: boolean,
+  apiKey: string
+): Promise<Response> {
   try {
     return await fetch(url, {
       headers: { Accept: accept },
@@ -234,7 +258,7 @@ async function fetchReleaseResource(url: string, accept: string, relay: boolean)
       // Proxy unreachable — fall through.
     }
     if (relay) {
-      return await fetchViaRelay(url)
+      return await fetchViaScraperApi(url, apiKey)
     }
     throw directError
   }
@@ -298,7 +322,7 @@ function apiCandidates(p: ParsedRepoUrl): string[] {
 }
 
 /** Errors that mean the browser could not even complete the request (CORS, DNS, offline). */
-const NETWORK_FAIL_RE = /network request failed|failed to fetch|networkerror|load failed|fetch failed|all public relays/i
+const NETWORK_FAIL_RE = /network request failed|failed to fetch|networkerror|load failed|fetch failed|scraperapi/i
 
 function isNetworkFailure(message: string): boolean {
   return NETWORK_FAIL_RE.test(message)
@@ -311,8 +335,8 @@ function isNetworkFailure(message: string): boolean {
  */
 function corsGuidanceError(p: ParsedRepoUrl, tried: string, technical: string, relay: boolean): SourceError {
   const fixes = relay
-    ? 'Public relays are enabled for this repository, but all of them are rate-limiting or down right now. Wait about a minute and check again (checking repositories one at a time helps), or ask the server admin to enable CORS.'
-    : 'Fixes: enable “Fetch via public relay” for this repository (Repos → Edit), track a GitHub mirror of the releases instead, or ask the server admin to enable CORS.'
+    ? 'ScraperAPI is enabled for this repository, but the proxied request failed — see the reason above. Verify that your API key (Settings → ScraperAPI) is valid and that your account still has credits, then check again.'
+    : 'Fixes: enable “Fetch via ScraperAPI” for this repository (Repos → Edit) and add your ScraperAPI key in Settings (3-dot menu), track a GitHub mirror of the releases instead, or ask the server admin to enable CORS.'
   return new SourceError(
     `${p.host} blocks browser access (no CORS headers), so this app cannot read it directly` +
       (tried ? ` (tried ${tried})` : '') +
@@ -321,11 +345,16 @@ function corsGuidanceError(p: ParsedRepoUrl, tried: string, technical: string, r
   )
 }
 
-async function tryApiCandidate(base: string, p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
+async function tryApiCandidate(
+  base: string,
+  p: ParsedRepoUrl,
+  relay: boolean,
+  apiKey: string
+): Promise<ReleaseInfo | 'empty'> {
   const url = `${base}/repos/${p.owner}/${p.repo}/releases?per_page=15`
   let res: Response
   try {
-    res = await fetchReleaseResource(url, 'application/vnd.github+json', relay)
+    res = await fetchReleaseResource(url, 'application/vnd.github+json', relay, apiKey)
   } catch (err) {
     throw asSourceError(err)
   }
@@ -371,18 +400,22 @@ async function tryApiCandidate(base: string, p: ParsedRepoUrl, relay: boolean): 
   }
 }
 
-async function fetchViaApi(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
+async function fetchViaApi(
+  p: ParsedRepoUrl,
+  relay: boolean,
+  apiKey: string
+): Promise<ReleaseInfo | 'empty'> {
   const candidates = apiCandidates(p)
   const problems: string[] = []
 
   for (const base of candidates) {
     try {
-      return await tryApiCandidate(base, p, relay)
+      return await tryApiCandidate(base, p, relay, apiKey)
     } catch (err) {
-      // If the relay chain itself is exhausted, every other API candidate and
-      // the HTML fallback would just queue up the same doomed relay chain —
-      // surface the rate-limit summary immediately instead.
-      if (err instanceof RelayExhaustedError) throw err
+      // If the ScraperAPI path itself failed, every other API candidate and
+      // the HTML fallback would just queue up the same doomed (and
+      // credit-consuming) proxied requests — surface the summary instead.
+      if (err instanceof ScrapeExhaustedError) throw err
       problems.push(err instanceof Error ? err.message : String(err))
     }
   }
@@ -472,9 +505,9 @@ function parseReleasesHtml(html: string, baseUrl: string): ReleaseInfo | null {
 }
 
 /** GitHub serves the asset list for a release as a small HTML fragment. */
-async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string, relay: boolean): Promise<AssetInfo[]> {
+async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string, relay: boolean, apiKey: string): Promise<AssetInfo[]> {
   const fragUrl = `${p.origin}/${p.owner}/${p.repo}/releases/expanded_assets/${encodeURIComponent(tag)}`
-  const res = await fetchReleaseResource(fragUrl, 'text/html', relay)
+  const res = await fetchReleaseResource(fragUrl, 'text/html', relay, apiKey)
   if (!res.ok) return []
   const contentType = res.headers.get('content-type') ?? ''
   if (!contentType.includes('html')) return []
@@ -504,10 +537,14 @@ async function fetchHtmlAssets(p: ParsedRepoUrl, tag: string, relay: boolean): P
   return assets
 }
 
-async function fetchViaHtml(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseInfo | 'empty'> {
+async function fetchViaHtml(
+  p: ParsedRepoUrl,
+  relay: boolean,
+  apiKey: string
+): Promise<ReleaseInfo | 'empty'> {
   let res: Response
   try {
-    res = await fetchReleaseResource(p.releasesUrl, 'text/html', relay)
+    res = await fetchReleaseResource(p.releasesUrl, 'text/html', relay, apiKey)
   } catch (err) {
     throw friendlyNetworkError(
       err,
@@ -526,7 +563,7 @@ async function fetchViaHtml(p: ParsedRepoUrl, relay: boolean): Promise<ReleaseIn
   if (!release) return 'empty'
 
   try {
-    release.assets = await fetchHtmlAssets(p, release.tag, relay)
+    release.assets = await fetchHtmlAssets(p, release.tag, relay, apiKey)
   } catch {
     // Asset list is best-effort; the release itself is still usable.
     release.assets = []
@@ -540,11 +577,14 @@ export type FetchResult = ReleaseInfo | 'empty'
 
 export interface FetchOptions {
   /**
-   * Retry failed lookups through a public CORS relay (third-party service).
-   * Strictly opt-in: requests then pass through infrastructure the user
-   * does not control, so it is only appropriate for public repositories.
+   * Route failed lookups through ScraperAPI (keyed third-party service;
+   * strictly opt-in). Legacy field name kept for compatibility with data
+   * saved by earlier versions and with exported configuration files — the
+   * UI presents this as "Fetch via ScraperAPI".
    */
   relay?: boolean
+  /** Device-local ScraperAPI API key (see settings.ts). */
+  scraperApiKey?: string | null
 }
 
 /**
@@ -557,10 +597,11 @@ export async function fetchLatestRelease(repoUrl: string, options: FetchOptions 
     throw new SourceError('Unrecognized repository URL. Expected something like https://github.com/owner/repo/releases')
   }
   const relay = options.relay === true
+  const apiKey = options.scraperApiKey ?? ''
 
   let apiError: unknown
   try {
-    return await fetchViaApi(parsed, relay)
+    return await fetchViaApi(parsed, relay, apiKey)
   } catch (err) {
     apiError = err
   }
@@ -574,9 +615,37 @@ export async function fetchLatestRelease(repoUrl: string, options: FetchOptions 
   }
 
   try {
-    return await fetchViaHtml(parsed, relay)
+    return await fetchViaHtml(parsed, relay, apiKey)
   } catch (htmlError) {
     const htmlMsg = htmlError instanceof Error ? htmlError.message : String(htmlError)
     throw new SourceError(`${apiMsg} — HTML fallback also failed: ${htmlMsg}`)
   }
+}
+
+/**
+ * Validate a ScraperAPI key from the Settings screen by performing one real
+ * proxied request to a tiny static page. Costs a single API credit but is
+ * the only reliable check — ScraperAPI's account endpoint is not available
+ * on every plan. Returns a human-readable success line; throws a
+ * SourceError whose message names the exact problem otherwise.
+ */
+export async function testScraperApiKey(key: string): Promise<string> {
+  const trimmed = key.trim()
+  if (!trimmed) {
+    throw new SourceError('Enter an API key first.')
+  }
+  let res: Response
+  try {
+    res = await fetch(
+      `${SCRAPERAPI_BASE}?api_key=${encodeURIComponent(trimmed)}&url=${encodeURIComponent('https://example.com')}`,
+      { cache: 'no-store', signal: timeoutSignal(30_000) }
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new SourceError(`Could not reach ScraperAPI: ${msg}`)
+  }
+  if (res.ok) {
+    return 'Key works — a test page was fetched successfully (1 API credit used).'
+  }
+  throw new SourceError(`Key test failed — ${await describeScraperError(res)}`)
 }

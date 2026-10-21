@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Database, Download, EllipsisVertical, Upload } from 'lucide-react'
+import { Database, EllipsisVertical } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
@@ -13,20 +13,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Toaster } from '@/components/ui/sonner'
 import { DetailsScreen } from '@/components/tracker/details-screen'
 import { MainScreen } from '@/components/tracker/main-screen'
 import { ReposScreen, type RepoDraft } from '@/components/tracker/repos-screen'
+import { SettingsScreen } from '@/components/tracker/settings-screen'
 import { ThemeToggle } from '@/components/tracker/theme-toggle'
 import { fetchLatestRelease, repoKey } from '@/lib/tracker/sources'
+import { loadScraperApiKey } from '@/lib/tracker/settings'
 import {
   deleteRepo as dbDeleteRepo,
   loadRepos,
@@ -40,7 +36,7 @@ import {
   type TrackedRepo,
 } from '@/lib/tracker/types'
 
-type View = { name: 'main' } | { name: 'repos' } | { name: 'details'; repoId: string }
+type View = { name: 'main' } | { name: 'repos' } | { name: 'settings' } | { name: 'details'; repoId: string }
 
 interface PendingImport {
   repos: ExportedRepo[]
@@ -212,7 +208,10 @@ export default function EmuTrackApp() {
       setCheckingIds(new Set(checkingIdsRef.current))
       const now = new Date().toISOString()
       try {
-        const result = await fetchLatestRelease(repo.url, { relay: repo.relay === true })
+        const result = await fetchLatestRelease(repo.url, {
+          relay: repo.relay === true,
+          scraperApiKey: loadScraperApiKey(),
+        })
         if (result === 'empty') {
           await mutateRepo(id, { latest: null, lastCheckedAt: now, lastStatus: 'empty', lastError: null })
         } else {
@@ -394,23 +393,14 @@ export default function EmuTrackApp() {
               <Database className="h-5 w-5" aria-hidden />
               <span className="hidden sm:inline">Repos</span>
             </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="More options">
-                  <EllipsisVertical className="h-5 w-5" aria-hidden />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => exportConfig()}>
-                  <Download className="h-4 w-4" aria-hidden />
-                  Export configuration
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
-                  <Upload className="h-4 w-4" aria-hidden />
-                  Import configuration
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setView({ name: 'settings' })}
+              aria-label="Open settings"
+            >
+              <EllipsisVertical className="h-5 w-5" aria-hidden />
+            </Button>
           </div>
         </header>
 
@@ -437,6 +427,12 @@ export default function EmuTrackApp() {
               onBack={() => setView({ name: 'main' })}
               onSave={handleSaveRepo}
               onDelete={handleDeleteRepo}
+            />
+          ) : effectiveView.name === 'settings' ? (
+            <SettingsScreen
+              onBack={() => setView({ name: 'main' })}
+              onExport={() => exportConfig()}
+              onImport={() => fileInputRef.current?.click()}
             />
           ) : (
             detailsRepo && (

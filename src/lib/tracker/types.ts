@@ -50,8 +50,11 @@ export interface TrackedRepo {
   lastStatus: CheckStatus
   /**
    * Opt-in fallback for servers that block browser access (no CORS
-   * headers): retry lookups through a public relay service. Requests then
-   * pass through a third party, so this is off unless the user enables it.
+   * headers): route lookups through ScraperAPI using the device-local API
+   * key (see settings.ts). Requests then pass through a keyed third-party
+   * service and consume API credits, so this is off unless the user
+   * enables it. Field name kept from earlier versions for data
+   * compatibility; the UI presents it as "Fetch via ScraperAPI".
    */
   relay?: boolean
 }
@@ -70,7 +73,8 @@ export interface ExportedRepo {
   lastAcknowledgedReleaseId?: string | null
   lastAcknowledgedTitle?: string | null
   lastAcknowledgedPublishedAt?: string | null
-  /** Optional device-local preference, carried along additively (v1 readers ignore unknown fields). */
+  /** Optional device-local preference, carried along additively (v1 readers ignore unknown fields).
+   *  Legacy name for the "Fetch via ScraperAPI" toggle. */
   relay?: boolean
 }
 

@@ -200,13 +200,14 @@ export function ReposScreen({ repos, onBack, onSave, onDelete }: ReposScreenProp
                   htmlFor="repo-relay"
                   className="text-sm font-normal leading-none"
                 >
-                  Fetch via public relay
+                  Fetch via ScraperAPI
                 </Label>
               </div>
               <p className="text-xs text-muted-foreground">
                 Only for servers that block browser access (no CORS headers), e.g. self-hosted
-                Forgejo/Gitea. When enabled, release lookups go through a third-party relay
-                service — use with public repositories only.
+                Forgejo/Gitea. Requires a ScraperAPI API key — set it in Settings (3-dot menu).
+                Each lookup through the proxy uses API credits — use with public repositories
+                only.
               </p>
             </div>
           </div>
