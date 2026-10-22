@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: 'EmuTrack — Emulator Release Tracker',
   description:
-    'Track releases of emulators hosted on GitHub or compatible self-hosted instances. Manual checks, local-only data, installable PWA.',
+    'Track releases of emulators hosted on GitHub or compatible self-hosted instances. Manual checks, local-only data.',
   applicationName: 'EmuTrack',
   // Relative URLs on purpose: they resolve against the page URL, which keeps
   // the app working on static hosts that serve it from a sub-path
